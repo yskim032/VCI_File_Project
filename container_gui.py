@@ -1,12 +1,206 @@
 import sys
 import os
+import pandas as pd
+from collections import defaultdict
+from typing import List, Dict, Set, Tuple
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLabel, QTextEdit, QPushButton, 
                            QFileDialog, QMessageBox, QTabWidget,
                            QFrame, QRadioButton, QButtonGroup)
 from PyQt5.QtCore import Qt, QMimeData
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
-from file_con import create_summary
+from openpyxl.styles import PatternFill
+from openpyxl import Workbook
+
+class ContainerAnalyzer:
+    def __init__(self, operation_type: str, tpf_containers: Set[str], truck_containers: Set[str]):
+        """
+        Initialize ContainerAnalyzer
+        
+        Args:
+            operation_type: 'DIS' or 'LOD'
+            tpf_containers: Set of container numbers for TPF
+            truck_containers: Set of container numbers for Truck
+        """
+        if operation_type not in ['DIS', 'LOD']:
+            raise ValueError("operation_type must be either 'DIS' or 'LOD'")
+            
+        self.operation_type = operation_type
+        self.tpf_containers = tpf_containers
+        self.truck_containers = truck_containers
+        self.container_groups = defaultdict(list)
+
+    def _extract_container_info(self, line: str) -> Tuple[str, str, str, str]:
+        """Extract container information from ASC file line"""
+        return (
+            line[6:17].strip(),   # container_number (MSBU3091780)
+            line[44:48].strip(),  # container_type (45-48 position)
+            line[51:52].strip(),  # full_empty (52 position)
+            line[19:22].strip(),  # operator_code (MSC)
+        )
+
+    def parse_container_data(self, line: str) -> Dict:
+        """Parse a single line from ASC file"""
+        container_number, container_type, full_empty, operator_code = self._extract_container_info(line)
+
+        # Extract weight from line[48:51] and convert to float
+        raw_weight = line[48:51].strip()
+        try:
+            weight = float(raw_weight) / 10
+        except ValueError:
+            weight = 0.0
+
+        # Check for IMO container (line[60:64])
+        is_imo = 'Yes' if line[60:64].strip() else 'NO'
+
+        # Check for OOG container in specified ranges
+        oog_ranges = [
+            line[92:95].strip(),  # [92,3]
+            line[95:98].strip(),  # [95,3]
+            line[98:101].strip(), # [98,3]
+            line[101:104].strip(), # [101,3]
+            line[104:107].strip()  # [104,3]
+        ]
+        is_oog = 'Yes' if any(oog_ranges) else 'No'
+
+        # Only print first 50 containers
+        if sum(len(containers) for containers in self.container_groups.values()) < 50:
+            print(f"Container: {container_number}, weight: {weight}")
+       
+        # Create container key based on all fields that affect grouping
+        group_key = (
+            self.operation_type,
+            container_type,
+            full_empty,
+            operator_code,
+            is_oog,  # OOG
+            'No',  # Damaged
+            'No',  # SOC
+            'No',  # Coastal Cargo
+            'No',  # To Rail
+            'No',  # To Barge
+            'Yes' if container_number in self.tpf_containers else 'No',  # To TPF
+            'Yes' if container_number in self.truck_containers else 'No',  # To Truck
+            'No',   # Not for MSC Account
+            is_imo  # IMO
+        )
+
+        return {
+            'container_number': container_number,
+            'group_key': group_key,
+            'weight': weight
+        }
+
+    def process_file(self, file_path: str) -> pd.DataFrame:
+        """
+        Process ASC file and return summary DataFrame
+        
+        Args:
+            file_path: Path to ASC file
+            
+        Returns:
+            DataFrame with container summary
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.startswith('$'):  # Skip header lines
+                        container_data = self.parse_container_data(line)
+                        # Only include containers with MSC operator code
+                        if container_data['group_key'][3] == 'MSC':
+                            self.container_groups[container_data['group_key']].append(
+                                (container_data['container_number'], container_data['weight'])
+                            )
+        except FileNotFoundError:
+            raise FileNotFoundError(f"ASC file not found: {file_path}")
+        except Exception as e:
+            raise Exception(f"Error processing ASC file: {str(e)}")
+
+        # Create summary records
+        summary_records = []
+        for group_key, containers in self.container_groups.items():
+            # Calculate total weight for the group and round to nearest integer
+            total_weight = round(sum(weight for _, weight in containers))
+            
+            record = {
+                'Operation': group_key[0],
+                'Container Type': group_key[1],
+                'Full/Empty': group_key[2],
+                'Operator Code': group_key[3],
+                'Weight': total_weight,
+                'Quantity': len(containers),
+                'OOG': group_key[4],
+                'Damaged': group_key[5],
+                'IMO': group_key[13],
+                'SOC': group_key[6],
+                'Coastal Cargo': group_key[7],
+                'To Rail': group_key[8],
+                'To Barge': group_key[9],
+                'To TPF': group_key[10],
+                'To Truck': group_key[11],
+                'Not for MSC Account': group_key[12]
+            }
+            summary_records.append(record)
+
+        # Create DataFrame
+        df = pd.DataFrame(summary_records)
+        column_order = [
+            'Operation', 'Container Type', 'Full/Empty', 'Operator Code', 'Weight',
+            'Quantity', 'OOG', 'Damaged', 'IMO', 'SOC', 'Coastal Cargo', 'To Rail',
+            'To Barge', 'To TPF', 'To Truck', 'Not for MSC Account'
+        ]
+        return df[column_order]
+
+def create_summary(asc_file: str, operation_type: str, 
+                  tpf_containers: List[str], truck_containers: List[str], 
+                  output_file: str = None) -> None:
+    """
+    Create container summary Excel file
+    
+    Args:
+        asc_file: Path to ASC file
+        operation_type: 'DIS' or 'LOD'
+        tpf_containers: List of container numbers for TPF
+        truck_containers: List of container numbers for Truck
+        output_file: Path to output Excel file (optional, defaults to ASC filename with .xlsx extension)
+    """
+    try:
+        # Convert container lists to sets for faster lookup
+        tpf_set = set(tpf_containers)
+        truck_set = set(truck_containers)
+
+        # Create analyzer and process file
+        analyzer = ContainerAnalyzer(operation_type, tpf_set, truck_set)
+        summary_df = analyzer.process_file(asc_file)
+
+        # Use dragged ASC filename for output if not specified
+        if output_file is None:
+            # Get just the filename from the full path
+            asc_filename = os.path.basename(asc_file)
+            output_file = asc_filename.replace('.ASC', '.xlsx')
+
+        # Create Excel writer with openpyxl engine
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            # Write DataFrame to Excel
+            summary_df.to_excel(writer, index=False, sheet_name='Summary')
+            
+            # Get the worksheet
+            worksheet = writer.sheets['Summary']
+            
+            # Define pink fill
+            pink_fill = PatternFill(start_color='FFFFC0CB', end_color='FFFFC0CB', fill_type='solid')
+            
+            # Apply pink fill to cells containing 'Yes'
+            for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
+                for cell in row:
+                    if cell.value == 'Yes':
+                        cell.fill = pink_fill
+
+        print(f"Summary successfully written to {output_file}")
+        
+    except Exception as e:
+        print(f"Error creating summary: {str(e)}")
+        raise
 
 class DropArea(QFrame):
     def __init__(self, parent=None):
@@ -200,28 +394,25 @@ class ContainerAnalyzerGUI(QMainWindow):
             # Get operation type based on radio selection
             operation_type = 'DIS' if self.discharge_radio.isChecked() else 'LOD'
             
-            # Get output file
-            output_file, _ = QFileDialog.getSaveFileName(
-                self, 'Save Summary File', 
-                'container_summary.xlsx',
-                'Excel Files (*.xlsx)'
+            # Create output file path using ASC filename
+            asc_filename = os.path.basename(asc_file)
+            output_file = asc_filename.replace('.ASC', '.xlsx')
+            output_path = os.path.join(os.path.dirname(asc_file), output_file)
+            
+            # Create summary
+            create_summary(
+                asc_file=asc_file,
+                operation_type=operation_type,
+                tpf_containers=tpf_containers,
+                truck_containers=truck_containers,
+                output_file=output_path
             )
             
-            if output_file:
-                # Create summary
-                create_summary(
-                    asc_file=asc_file,
-                    operation_type=operation_type,
-                    tpf_containers=tpf_containers,
-                    truck_containers=truck_containers,
-                    output_file=output_file
-                )
-                
-                QMessageBox.information(
-                    self, 
-                    'Success', 
-                    f'Summary가 성공적으로 생성되었습니다:\n{output_file}'
-                )
+            QMessageBox.information(
+                self, 
+                'Success', 
+                f'Summary가 성공적으로 생성되었습니다:\n{output_path}'
+            )
                 
         except Exception as e:
             QMessageBox.critical(self, 'Error', str(e))

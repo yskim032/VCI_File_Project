@@ -1,6 +1,7 @@
 import pandas as pd
 from collections import defaultdict
 from typing import List, Dict, Set
+import os
 
 class ContainerAnalyzer:
     def __init__(self, operation_type: str, tpf_containers: Set[str], truck_containers: Set[str]):
@@ -11,10 +12,14 @@ class ContainerAnalyzer:
 
     def parse_container_data(self, line: str) -> Dict:
         """Parse a single line from ASC file"""
-        container_number = line[6:18].strip()
+        container_number = line[7:19].strip()
         container_type = line[44:48].strip()  # 45-48 position
         full_empty = line[51:52].strip()      # 52 position
         operator_code = line[19:22].strip()   # 20-22 position
+        
+
+        
+        imo = line[58:62].strip()             # 59-62 position
 
         # Create container key based on all fields that affect grouping
         group_key = (
@@ -30,7 +35,9 @@ class ContainerAnalyzer:
             'No',  # To Barge
             'Yes' if container_number in self.tpf_containers else 'No',  # To TPF
             'Yes' if container_number in self.truck_containers else 'No',  # To Truck
-            'No'   # Not for MSC Account
+            'No',   # Not for MSC Account
+            weight,  # Weight
+            imo     # IMO
         )
 
         return {
@@ -49,7 +56,9 @@ class ContainerAnalyzer:
                 'To Barge': 'No',
                 'To TPF': 'Yes' if container_number in self.tpf_containers else 'No',
                 'To Truck': 'Yes' if container_number in self.truck_containers else 'No',
-                'Not for MSC Account': 'No'
+                'Not for MSC Account': 'No',
+                'Weight': weight,
+                'IMO': imo
             }
         }
 
@@ -72,24 +81,32 @@ class ContainerAnalyzer:
                 'Container Type': group_key[1],
                 'Full/Empty': group_key[2],
                 'Operator Code': group_key[3],
-                'Quantity': len(containers),
+                'Weight': group_key[13],  # Weight column
                 'OOG': group_key[4],
                 'Damaged': group_key[5],
                 'SOC': group_key[6],
+                'IMO': group_key[14],     # IMO column
                 'Coastal Cargo': group_key[7],
                 'To Rail': group_key[8],
                 'To Barge': group_key[9],
                 'To TPF': group_key[10],
                 'To Truck': group_key[11],
-                'Not for MSC Account': group_key[12]
+                'Not for MSC Account': group_key[12],
+                'Quantity': len(containers)  # Restored Quantity column
             }
             summary_records.append(record)
 
-        return pd.DataFrame(summary_records)
+        # Create DataFrame and reorder columns
+        df = pd.DataFrame(summary_records)
+        column_order = [
+            'Operation', 'Container Type', 'Full/Empty', 'Operator Code', 'Weight',
+            'OOG', 'Damaged', 'SOC', 'IMO', 'Coastal Cargo', 'To Rail', 'To Barge',
+            'To TPF', 'To Truck', 'Not for MSC Account', 'Quantity'
+        ]
+        return df[column_order]
 
 def create_summary(asc_file: str, operation_type: str, 
-                  tpf_containers: List[str], truck_containers: List[str], 
-                  output_file: str):
+                  tpf_containers: List[str], truck_containers: List[str]):
     """
     Create container summary Excel file
     
@@ -98,7 +115,6 @@ def create_summary(asc_file: str, operation_type: str,
         operation_type: 'DIS' or 'LOD'
         tpf_containers: List of container numbers for TPF
         truck_containers: List of container numbers for Truck
-        output_file: Path to output Excel file
     """
     # Convert container lists to sets for faster lookup
     tpf_set = set(tpf_containers)
@@ -107,6 +123,12 @@ def create_summary(asc_file: str, operation_type: str,
     # Create analyzer and process file
     analyzer = ContainerAnalyzer(operation_type, tpf_set, truck_set)
     summary_df = analyzer.process_file(asc_file)
+
+    # Generate output file path with same name as ASC file but .xlsx extension
+    # Get the base name of the ASC file (without path)
+    base_name = os.path.basename(asc_file)
+    # Remove the extension and add .xlsx
+    output_file = os.path.splitext(base_name)[0] + '.xlsx'
 
     # Write to Excel
     summary_df.to_excel(output_file, index=False)
@@ -118,6 +140,5 @@ if __name__ == "__main__":
     operation_type = "DIS"  # or "LOD"
     tpf_containers = []  # List of container numbers for TPF
     truck_containers = []  # List of container numbers for Truck
-    output_file = "container_summary.xlsx"
 
-    create_summary(asc_file, operation_type, tpf_containers, truck_containers, output_file) 
+    create_summary(asc_file, operation_type, tpf_containers, truck_containers) 
